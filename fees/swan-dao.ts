@@ -32,6 +32,7 @@ const EVENTS = {
   accruedLocalReserves: 'event AccruedLocalReserves(uint256 amount)',
   accruedGlobalReserves: 'event AccruedGlobalReserves(uint256 amount)',
   redeemed: 'event Redeemed(address indexed account, address indexed borrower, uint256 amountIn, uint256 amountOut)',
+  liquidated: 'event Liquidated(address indexed borrower, address indexed liquidator, uint256 repayAmount, uint256 collateralOut)',
   bought: 'event Bought(address indexed account, uint256 assetIn, uint256 coinOut)',
   transfer: 'event Transfer(address indexed from, address indexed to, uint256 amount)',
 };
@@ -43,6 +44,7 @@ const LABELS = {
   INTEREST_TO_STAKERS: 'Borrow Interest To sSwanUSD Stakers',
   INTEREST_TO_MONOLITH: 'Borrow Interest To Monolith',
   REDEMPTION_FEES_TO_BORROWERS: 'Redemption Fees To Borrowers',
+  LIQUIDATION_FEES_TO_LIQUIDATORS: 'Liquidation Fees To Liquidators',
   INTEREST_TO_DAO: 'Borrow Interest To Swan DAO',
   PSM_YIELD_TO_DAO: 'PSM sUSDS Yield To Swan DAO',
   PSM_MINT_FEES_TO_DAO: 'PSM Mint Fees To Swan DAO',
@@ -87,11 +89,12 @@ const fetch = async (options: FetchOptions) => {
   // (logs cover fromBlock..toBlock); otherwise the changes in fromBlock fall between windows.
   const openingApi = new ChainApi({ chain: options.chain, block: Math.max(fromBlock - 1, LENDER_DEPLOY_BLOCK) });
 
-  const [interestLogs, localReservePulls, globalReservePulls, redemptions, swanUsdTransfers, opening, closing, [redeemFeeBps, buyFeeBps, govStakingBps]] = await Promise.all([
+  const [interestLogs, localReservePulls, globalReservePulls, redemptions, liquidations, swanUsdTransfers, opening, closing, [redeemFeeBps, buyFeeBps, govStakingBps]] = await Promise.all([
     options.getLogs({ target: LENDER, eventAbi: EVENTS.interestAccrued }),
     options.getLogs({ target: LENDER, eventAbi: EVENTS.accruedLocalReserves }),
     options.getLogs({ target: LENDER, eventAbi: EVENTS.accruedGlobalReserves }),
     options.getLogs({ target: LENDER, eventAbi: EVENTS.redeemed }),
+    options.getLogs({ target: LENDER, eventAbi: EVENTS.liquidated, onlyArgs: false }),
     options.getLogs({ target: SWANUSD, eventAbi: EVENTS.transfer }),
     getReserves(openingApi),
     getReserves(options.toApi),
@@ -134,14 +137,30 @@ const fetch = async (options: FetchOptions) => {
   // Redeemers get collateral worth amountIn minus redeemFeeBps (1.75% since launch); the redeemed borrower keeps the fee.
   const redemptionFees = sum(redemptions, 'amountIn') * BigInt(redeemFeeBps) / 10000n;
 
+  // Liquidators repay debt and get collateral worth 0-10% more at the Lender's oracle price, paid by the liquidated
+  // borrower. The price (scaled so collateral * price / 1e18 is in SwanUSD) is read at the end of the liquidation's
+  // block, since liquidations usually follow an oracle update in the same block. Write-offs (debt above 100x the
+  // collateral value) hand the leftover collateral to the liquidator and spread the debt over the other
+  // borrowers: that is bad debt, not a fee, so it is not counted.
+  let liquidationFees = 0n;
+  for (const { blockNumber, args } of liquidations) {
+    const { price } = await new ChainApi({ chain: options.chain, block: blockNumber }).call({
+      target: LENDER, abi: 'function getCollateralPrice() view returns (uint256 price, bool reduceOnly, bool allowLiquidations)',
+    });
+    const incentive = BigInt(args.collateralOut) * BigInt(price) / 10n ** 18n - BigInt(args.repayAmount);
+    if (incentive > 0n) liquidationFees += incentive;
+  }
+
   dailyFees.add(USDS, interest, METRIC.BORROW_INTEREST);
   dailyFees.add(USDS, psmYield, LABELS.PSM_YIELD);
   dailyFees.add(USDS, psmMintFees, LABELS.PSM_MINT_FEES);
   dailyFees.add(USDS, redemptionFees, LABELS.REDEMPTION_FEES);
+  dailyFees.add(USDS, liquidationFees, METRIC.LIQUIDATION_FEES);
 
   dailySupplySideRevenue.add(USDS, interestToStakers, LABELS.INTEREST_TO_STAKERS);
   dailySupplySideRevenue.add(USDS, interestToMonolith, LABELS.INTEREST_TO_MONOLITH);
   dailySupplySideRevenue.add(USDS, redemptionFees, LABELS.REDEMPTION_FEES_TO_BORROWERS);
+  dailySupplySideRevenue.add(USDS, liquidationFees, LABELS.LIQUIDATION_FEES_TO_LIQUIDATORS);
 
   dailyRevenue.add(USDS, interestToDao, LABELS.INTEREST_TO_DAO);
   dailyRevenue.add(USDS, psmYield, LABELS.PSM_YIELD_TO_DAO);
@@ -160,9 +179,9 @@ const fetch = async (options: FetchOptions) => {
 };
 
 const methodology = {
-  Fees: 'Interest paid by SwanUSD borrowers who opt out of redemptions, sUSDS yield earned on the USDS reserves of the SwanUSD PSM, PSM mint fees and the redemption fees redeemers pay to borrowers. Excludes liquidation incentives paid to liquidators and SWAN emissions.',
+  Fees: 'Interest paid by SwanUSD borrowers who opt out of redemptions, sUSDS yield earned on the USDS reserves of the SwanUSD PSM, PSM mint fees, the redemption fees redeemers pay to borrowers and the liquidation incentives liquidated borrowers pay to liquidators. Excludes SWAN emissions and collateral handed to liquidators in bad-debt write-offs.',
   Revenue: 'Swan DAO\'s share of borrow interest (the market\'s local reserve fee, 50% since launch, plus any interest above what sSwanUSD stakers can receive), all sUSDS yield on the PSM reserves and all PSM mint fees.',
-  SupplySideRevenue: 'Borrow interest paid to sSwanUSD stakers, the Monolith protocol fee on borrow interest (0% so far), and redemption fees kept by the borrowers whose collateral is redeemed.',
+  SupplySideRevenue: 'Borrow interest paid to sSwanUSD stakers, the Monolith protocol fee on borrow interest (0% so far), redemption fees kept by the borrowers whose collateral is redeemed, and liquidation incentives paid to liquidators.',
   HoldersRevenue: 'Swan DAO revenue distributed to SWAN stakers (sSWAN) by the RevenueRouter, 100% of it since launch.',
   ProtocolRevenue: 'Swan DAO revenue sent to the DAO treasury instead of SWAN stakers, 0% of it since launch.',
 };
@@ -173,11 +192,13 @@ const breakdownMethodology = {
     [LABELS.PSM_YIELD]: 'Yield earned by the PSM USDS reserves deposited in sUSDS.',
     [LABELS.PSM_MINT_FEES]: 'Fee on minting SwanUSD with USDS through the PSM, ramping from 0% to 1% over the second half of the immutability period (from 2028-10-22).',
     [LABELS.REDEMPTION_FEES]: 'Fee paid by redeemers when they swap SwanUSD for the collateral of redeemable borrowers (1.75% since launch).',
+    [METRIC.LIQUIDATION_FEES]: 'Collateral liquidators receive above the debt they repay, from 0% to 10% of the repaid debt depending on how far the position is past its collateral factor.',
   },
   SupplySideRevenue: {
     [LABELS.INTEREST_TO_STAKERS]: 'Borrow interest after the market and Monolith fees, paid to sSwanUSD stakers.',
     [LABELS.INTEREST_TO_MONOLITH]: 'Monolith protocol fee on borrow interest, set by the Monolith factory (0% so far, 10% max).',
     [LABELS.REDEMPTION_FEES_TO_BORROWERS]: 'Redemption fees kept as collateral by the redeemed borrowers.',
+    [LABELS.LIQUIDATION_FEES_TO_LIQUIDATORS]: 'All liquidation incentives, paid to liquidators.',
   },
   Revenue: {
     [LABELS.INTEREST_TO_DAO]: 'Local reserve fee on borrow interest (50% since launch), plus any interest above what sSwanUSD stakers can receive.',
